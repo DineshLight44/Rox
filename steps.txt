@@ -1,0 +1,17 @@
+pip install tensorflow librosa scikit-learn matplotlib seaborn pandas soundfile
+
+
+# Replace synthetic data with real datasets
+X, y = load_real_datasets(
+    coughvid_path='path/to/coughvid',
+    coswara_path='path/to/coswara',
+    sound_dr_path='path/to/sound-dr'
+)
+
+# Execute the main pipeline
+python cough_classification_system.py
+
+Step 4: Use for Inference
+from simple_inference import predict_cough
+predicted_class, confidence, probs = predict_cough('new_cough_sample.wav')
+print(f"Prediction: {predicted_class} (Confidence: {confidence:.3f})")
