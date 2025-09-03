@@ -1,0 +1,1286 @@
+# Cell 1: Install and Import Dependencies
+# Run this cell first to install required packages
+
+!pip install librosa tensorflow scikit-learn matplotlib seaborn pandas soundfile tqdm
+
+import os
+import numpy as np
+import pandas as pd
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve, f1_score
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better plots
+plt.style.use('default')
+sns.set_palette("husl")
+
+print("✅ All dependencies imported successfully!")
+print(f"TensorFlow version: {tf.__version__}")
+print(f"Librosa version: {librosa.__version__}")
+
+# =============================================================================
+# Cell 2: Audio Preprocessing Class
+# =============================================================================
+
+class CoughPreprocessor:
+    """Audio preprocessing class for cough sound analysis"""
+    
+    def __init__(self, sr=22050, n_mfcc=13, n_mels=64, hop_length=512, n_fft=2048):
+        self.sr = sr
+        self.n_mfcc = n_mfcc
+        self.n_mels = n_mels
+        self.hop_length = hop_length
+        self.n_fft = n_fft
+        print(f"🎵 Preprocessor initialized:")
+        print(f"   Sample Rate: {sr} Hz")
+        print(f"   MFCC coefficients: {n_mfcc}")
+        print(f"   Mel bands: {n_mels}")
+    
+    def load_audio(self, file_path, duration=3.0):
+        """Load and normalize audio file"""
+        try:
+            audio, sr = librosa.load(file_path, sr=self.sr, duration=duration)
+            return audio
+        except Exception as e:
+            print(f"❌ Error loading {file_path}: {e}")
+            return None
+    
+    def remove_silence(self, audio, top_db=30):
+        """Remove silence from audio"""
+        audio_trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
+        return audio_trimmed
+    
+    def noise_reduction(self, audio, noise_factor=0.005):
+        """Simple noise reduction"""
+        noise_sample = audio[:int(0.5 * self.sr)]
+        noise_power = np.mean(noise_sample ** 2)
+        audio_clean = np.where(np.abs(audio) > noise_factor * np.sqrt(noise_power), 
+                              audio, audio * 0.1)
+        return audio_clean
+    
+    def extract_mfcc(self, audio, target_length=128):
+        """Extract MFCC features"""
+        mfcc = librosa.feature.mfcc(y=audio, sr=self.sr, n_mfcc=self.n_mfcc,
+                                   hop_length=self.hop_length, n_fft=self.n_fft)
+        
+        if mfcc.shape[1] < target_length:
+            mfcc = np.pad(mfcc, ((0, 0), (0, target_length - mfcc.shape[1])), mode='constant')
+        else:
+            mfcc = mfcc[:, :target_length]
+        
+        return mfcc
+    
+    def extract_mel_spectrogram(self, audio, target_length=128):
+        """Extract mel spectrogram"""
+        mel_spec = librosa.feature.melspectrogram(y=audio, sr=self.sr, n_mels=self.n_mels,
+                                                 hop_length=self.hop_length, n_fft=self.n_fft)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        if mel_spec_db.shape[1] < target_length:
+            mel_spec_db = np.pad(mel_spec_db, ((0, 0), (0, target_length - mel_spec_db.shape[1])), mode='constant')
+        else:
+            mel_spec_db = mel_spec_db[:, :target_length]
+        
+        return mel_spec_db
+    
+    def visualize_audio_features(self, audio, title="Audio Analysis"):
+        """Visualize audio waveform and extracted features"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle(title, fontsize=16)
+        
+        # Waveform
+        axes[0, 0].plot(audio)
+        axes[0, 0].set_title('Waveform')
+        axes[0, 0].set_xlabel('Sample')
+        axes[0, 0].set_ylabel('Amplitude')
+        
+        # Spectrogram
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(audio)), ref=np.max)
+        librosa.display.specshow(D, sr=self.sr, hop_length=self.hop_length, 
+                               x_axis='time', y_axis='hz', ax=axes[0, 1])
+        axes[0, 1].set_title('Spectrogram')
+        
+        # MFCC
+        mfcc = self.extract_mfcc(audio)
+        librosa.display.specshow(mfcc, sr=self.sr, hop_length=self.hop_length,
+                               x_axis='time', ax=axes[1, 0])
+        axes[1, 0].set_title('MFCC Features')
+        
+        # Mel Spectrogram
+        mel_spec = self.extract_mel_spectrogram(audio)
+        librosa.display.specshow(mel_spec, sr=self.sr, hop_length=self.hop_length,
+                               x_axis='time', y_axis='mel', ax=axes[1, 1])
+        axes[1, 1].set_title('Mel Spectrogram')
+        
+        plt.tight_layout()
+        plt.show()
+
+print("✅ CoughPreprocessor class defined!")
+
+# =============================================================================
+# Cell 3: Dataset Loader Class
+# =============================================================================
+
+class CoughDatasetLoader:
+    """Dataset loader for multiple cough datasets with progress tracking"""
+    
+    def __init__(self, preprocessor):
+        self.preprocessor = preprocessor
+        self.data = []
+        self.labels = []
+        self.file_paths = []
+    
+    def load_coughvid_dataset(self, data_path, metadata_path):
+        """Load COUGHVID dataset with progress bar"""
+        print("📁 Loading COUGHVID dataset...")
+        
+        if not os.path.exists(metadata_path):
+            print(f"❌ Metadata file not found: {metadata_path}")
+            return
+        
+        metadata = pd.read_csv(metadata_path)
+        print(f"📊 Found {len(metadata)} entries in metadata")
+        
+        successful_loads = 0
+        
+        for idx, row in tqdm(metadata.iterrows(), total=len(metadata), desc="Processing COUGHVID"):
+            file_path = os.path.join(data_path, str(row['uuid']) + '.wav')
+            
+            if os.path.exists(file_path):
+                audio = self.preprocessor.load_audio(file_path)
+                if audio is not None:
+                    # Process audio
+                    audio = self.preprocessor.remove_silence(audio)
+                    audio = self.preprocessor.noise_reduction(audio)
+                    
+                    # Extract features
+                    mfcc = self.preprocessor.extract_mfcc(audio)
+                    mel_spec = self.preprocessor.extract_mel_spectrogram(audio)
+                    features = np.concatenate([mfcc, mel_spec], axis=0)
+                    
+                    self.data.append(features)
+                    self.file_paths.append(file_path)
+                    
+                    # Label mapping (adjust based on your metadata structure)
+                    if 'status' in row:
+                        label = 'healthy' if row['status'] == 'healthy' else 'unhealthy'
+                    elif 'covid_status' in row:
+                        label = 'covid' if row['covid_status'] == 'positive' else 'healthy'
+                    else:
+                        label = 'unknown'
+                    
+                    self.labels.append(label)
+                    successful_loads += 1
+        
+        print(f"✅ Successfully loaded {successful_loads} samples from COUGHVID")
+    
+    def load_coswara_dataset(self, data_path):
+        """Load Coswara dataset with progress bar"""
+        print("📁 Loading Coswara dataset...")
+        
+        # Expected directory structure: data_path/condition/audio_files
+        conditions = ['healthy', 'covid', 'asthma', 'cold', 'bronchitis']
+        successful_loads = 0
+        
+        for condition in conditions:
+            condition_path = os.path.join(data_path, condition)
+            if os.path.exists(condition_path):
+                files = [f for f in os.listdir(condition_path) if f.endswith(('.wav', '.mp3'))]
+                
+                for file_name in tqdm(files, desc=f"Processing {condition}"):
+                    file_path = os.path.join(condition_path, file_name)
+                    
+                    audio = self.preprocessor.load_audio(file_path)
+                    if audio is not None:
+                        # Process audio
+                        audio = self.preprocessor.remove_silence(audio)
+                        audio = self.preprocessor.noise_reduction(audio)
+                        
+                        # Extract features
+                        mfcc = self.preprocessor.extract_mfcc(audio)
+                        mel_spec = self.preprocessor.extract_mel_spectrogram(audio)
+                        features = np.concatenate([mfcc, mel_spec], axis=0)
+                        
+                        self.data.append(features)
+                        self.labels.append(condition)
+                        self.file_paths.append(file_path)
+                        successful_loads += 1
+            else:
+                print(f"⚠️  Directory not found: {condition_path}")
+        
+        print(f"✅ Successfully loaded {successful_loads} samples from Coswara")
+    
+    def load_custom_dataset(self, data_path, label_mapping=None):
+        """Load custom dataset with flexible structure"""
+        print("📁 Loading custom dataset...")
+        
+        if label_mapping is None:
+            label_mapping = {
+                'healthy': 'healthy',
+                'covid': 'covid',
+                'asthma': 'asthma',
+                'bronchitis': 'bronchitis'
+            }
+        
+        successful_loads = 0
+        
+        for root, dirs, files in os.walk(data_path):
+            for file_name in files:
+                if file_name.endswith(('.wav', '.mp3')):
+                    file_path = os.path.join(root, file_name)
+                    
+                    # Infer label from directory name or filename
+                    label = 'unknown'
+                    for key in label_mapping.keys():
+                        if key.lower() in root.lower() or key.lower() in file_name.lower():
+                            label = label_mapping[key]
+                            break
+                    
+                    audio = self.preprocessor.load_audio(file_path)
+                    if audio is not None:
+                        audio = self.preprocessor.remove_silence(audio)
+                        audio = self.preprocessor.noise_reduction(audio)
+                        
+                        mfcc = self.preprocessor.extract_mfcc(audio)
+                        mel_spec = self.preprocessor.extract_mel_spectrogram(audio)
+                        features = np.concatenate([mfcc, mel_spec], axis=0)
+                        
+                        self.data.append(features)
+                        self.labels.append(label)
+                        self.file_paths.append(file_path)
+                        successful_loads += 1
+        
+        print(f"✅ Successfully loaded {successful_loads} samples from custom dataset")
+    
+    def get_dataset_summary(self):
+        """Display dataset summary"""
+        if not self.data:
+            print("❌ No data loaded yet!")
+            return
+        
+        print("\n📊 DATASET SUMMARY:")
+        print("=" * 40)
+        print(f"Total samples: {len(self.data)}")
+        print(f"Feature shape: {self.data[0].shape}")
+        
+        # Label distribution
+        label_counts = pd.Series(self.labels).value_counts()
+        print(f"\n🏷️  Label Distribution:")
+        for label, count in label_counts.items():
+            percentage = (count / len(self.labels)) * 100
+            print(f"   {label}: {count} samples ({percentage:.1f}%)")
+        
+        # Plot label distribution
+        plt.figure(figsize=(10, 6))
+        label_counts.plot(kind='bar', color='skyblue', alpha=0.8)
+        plt.title('Dataset Label Distribution')
+        plt.xlabel('Condition')
+        plt.ylabel('Number of Samples')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+        
+        return label_counts
+    
+    def get_data(self, apply_augmentation=False):
+        """Get processed data with optional augmentation"""
+        if not self.data:
+            print("❌ No data available! Load datasets first.")
+            return None, None
+        
+        X = np.array(self.data)
+        y = np.array(self.labels)
+        
+        if apply_augmentation:
+            print("🔄 Applying data augmentation...")
+            # Simple augmentation by adding noise to existing samples
+            augmented_X = []
+            augmented_y = []
+            
+            for features, label in tqdm(zip(X, y), total=len(X), desc="Augmenting"):
+                # Original sample
+                augmented_X.append(features)
+                augmented_y.append(label)
+                
+                # Add noisy version
+                noise = np.random.normal(0, 0.01, features.shape)
+                augmented_X.append(features + noise)
+                augmented_y.append(label)
+            
+            X = np.array(augmented_X)
+            y = np.array(augmented_y)
+            print(f"✅ Augmentation complete. New dataset size: {len(X)}")
+        
+        return X, y
+
+print("✅ CoughDatasetLoader class defined!")
+
+# =============================================================================
+# Cell 4: Model Architecture Classes
+# =============================================================================
+
+class CoughClassificationModel:
+    """CNN and CNN+RNN models for cough classification"""
+    
+    def __init__(self, input_shape, num_classes):
+        self.input_shape = input_shape
+        self.num_classes = num_classes
+        self.model = None
+        print(f"🧠 Model initialized:")
+        print(f"   Input shape: {input_shape}")
+        print(f"   Number of classes: {num_classes}")
+    
+    def build_cnn_model(self, dropout_rate=0.5):
+        """Build CNN model for spectrogram classification"""
+        print("🏗️  Building CNN model...")
+        
+        model = keras.Sequential([
+            layers.Reshape((*self.input_shape, 1), input_shape=self.input_shape),
+            
+            # First CNN block
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            # Second CNN block
+            layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            # Third CNN block
+            layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            # Fourth CNN block
+            layers.Conv2D(256, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.GlobalAveragePooling2D(),
+            layers.Dropout(dropout_rate),
+            
+            # Dense layers
+            layers.Dense(512, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(dropout_rate),
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(0.3),
+            layers.Dense(self.num_classes, activation='softmax')
+        ])
+        
+        self.model = model
+        print("✅ CNN model built successfully!")
+        return model
+    
+    def build_cnn_rnn_model(self, dropout_rate=0.5):
+        """Build CNN+RNN hybrid model"""
+        print("🏗️  Building CNN+RNN hybrid model...")
+        
+        model = keras.Sequential([
+            layers.Reshape((*self.input_shape, 1), input_shape=self.input_shape),
+            
+            # CNN feature extraction
+            layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            
+            # Reshape for RNN (flatten spatial dimensions, keep temporal)
+            layers.Reshape((self.input_shape[0] // 4, -1)),
+            
+            # RNN temporal modeling
+            layers.LSTM(128, return_sequences=True, dropout=0.3, recurrent_dropout=0.3),
+            layers.LSTM(64, dropout=0.3, recurrent_dropout=0.3),
+            
+            # Dense layers
+            layers.Dense(256, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(dropout_rate),
+            layers.Dense(128, activation='relu'),
+            layers.Dropout(0.3),
+            layers.Dense(self.num_classes, activation='softmax')
+        ])
+        
+        self.model = model
+        print("✅ CNN+RNN model built successfully!")
+        return model
+    
+    def compile_model(self, learning_rate=0.001):
+        """Compile the model"""
+        optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        self.model.compile(
+            optimizer=optimizer,
+            loss='categorical_crossentropy',
+            metrics=['accuracy', 'precision', 'recall']
+        )
+        print(f"✅ Model compiled with learning rate: {learning_rate}")
+    
+    def train(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32, model_name="model"):
+        """Train the model with callbacks"""
+        print(f"🚀 Starting training for {epochs} epochs...")
+        
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, verbose=1),
+            ModelCheckpoint(f'best_{model_name}.h5', monitor='val_accuracy', 
+                          save_best_only=True, mode='max', verbose=1)
+        ]
+        
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        print("✅ Training completed!")
+        return history
+
+print("✅ CoughClassificationModel class defined!")
+
+# =============================================================================
+# Cell 5: Evaluation and Visualization Class
+# =============================================================================
+
+class CoughClassificationEvaluator:
+    """Evaluation and visualization class with interactive plots"""
+    
+    def __init__(self, model, class_names):
+        self.model = model
+        self.class_names = class_names
+    
+    def evaluate_model(self, X_test, y_test, show_plots=True):
+        """Comprehensive model evaluation"""
+        print("🔍 Evaluating model performance...")
+        
+        # Predictions
+        y_pred_proba = self.model.predict(X_test, verbose=0)
+        y_pred = np.argmax(y_pred_proba, axis=1)
+        y_true = np.argmax(y_test, axis=1)
+        
+        # Classification report
+        print("\n📊 CLASSIFICATION REPORT:")
+        print("=" * 50)
+        print(classification_report(y_true, y_pred, target_names=self.class_names))
+        
+        # Calculate F1 scores
+        f1_weighted = f1_score(y_true, y_pred, average='weighted')
+        f1_macro = f1_score(y_true, y_pred, average='macro')
+        
+        print(f"\n🎯 F1-Scores:")
+        print(f"   Weighted F1: {f1_weighted:.3f}")
+        print(f"   Macro F1: {f1_macro:.3f}")
+        
+        if show_plots:
+            # Confusion matrix
+            self.plot_confusion_matrix(y_true, y_pred)
+            
+            # ROC curves
+            self.plot_roc_curves(y_test, y_pred_proba)
+            
+            # Precision-Recall curves
+            self.plot_precision_recall_curves(y_test, y_pred_proba)
+        
+        return y_pred, y_pred_proba, f1_weighted
+    
+    def plot_confusion_matrix(self, y_true, y_pred):
+        """Plot confusion matrix with percentages"""
+        cm = confusion_matrix(y_true, y_pred)
+        cm_percentage = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+        
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Absolute counts
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=self.class_names, yticklabels=self.class_names, ax=axes[0])
+        axes[0].set_title('Confusion Matrix (Counts)')
+        axes[0].set_xlabel('Predicted')
+        axes[0].set_ylabel('Actual')
+        
+        # Percentages
+        sns.heatmap(cm_percentage, annot=True, fmt='.1f', cmap='Oranges',
+                   xticklabels=self.class_names, yticklabels=self.class_names, ax=axes[1])
+        axes[1].set_title('Confusion Matrix (Percentages)')
+        axes[1].set_xlabel('Predicted')
+        axes[1].set_ylabel('Actual')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_roc_curves(self, y_test, y_pred_proba):
+        """Plot ROC curves for each class"""
+        plt.figure(figsize=(12, 8))
+        
+        colors = plt.cm.Set1(np.linspace(0, 1, len(self.class_names)))
+        
+        for i, (class_name, color) in enumerate(zip(self.class_names, colors)):
+            fpr, tpr, _ = roc_curve(y_test[:, i], y_pred_proba[:, i])
+            roc_auc = auc(fpr, tpr)
+            
+            plt.plot(fpr, tpr, color=color, lw=2, 
+                    label=f'{class_name} (AUC = {roc_auc:.3f})')
+        
+        plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Random (AUC = 0.500)')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic (ROC) Curves')
+        plt.legend(loc='lower right')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_precision_recall_curves(self, y_test, y_pred_proba):
+        """Plot Precision-Recall curves"""
+        plt.figure(figsize=(12, 8))
+        
+        colors = plt.cm.Set2(np.linspace(0, 1, len(self.class_names)))
+        
+        for i, (class_name, color) in enumerate(zip(self.class_names, colors)):
+            precision, recall, _ = precision_recall_curve(y_test[:, i], y_pred_proba[:, i])
+            pr_auc = auc(recall, precision)
+            
+            plt.plot(recall, precision, color=color, lw=2,
+                    label=f'{class_name} (AUC = {pr_auc:.3f})')
+        
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curves')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+print("✅ CoughClassificationEvaluator class defined!")
+
+# =============================================================================
+# Cell 6: Create Sample Dataset (for demonstration)
+# =============================================================================
+
+def create_realistic_sample_dataset():
+    """Create a realistic sample dataset for demonstration"""
+    print("🔬 Creating realistic sample dataset for demonstration...")
+    
+    np.random.seed(42)
+    
+    # Parameters
+    n_samples_per_class = 250
+    classes = ['healthy', 'covid', 'asthma', 'bronchitis']
+    feature_dim = 77  # 13 MFCC + 64 mel spectrogram
+    sequence_length = 128
+    
+    X = []
+    y = []
+    
+    for class_idx, class_name in enumerate(classes):
+        print(f"   Generating {n_samples_per_class} samples for {class_name}...")
+        
+        for _ in range(n_samples_per_class):
+            # Base features
+            features = np.random.randn(feature_dim, sequence_length) * 0.5
+            
+            # Add class-specific patterns
+            if class_name == 'healthy':
+                # Healthy coughs: more uniform patterns
+                features += np.random.normal(0, 0.1, features.shape)
+                
+            elif class_name == 'covid':
+                # COVID: distinct patterns in higher MFCC coefficients
+                features[8:13, :] += np.random.normal(0.3, 0.15, (5, sequence_length))
+                # Add some periodic patterns
+                for i in range(5, 10):
+                    features[i, :] += 0.2 * np.sin(np.linspace(0, 2*np.pi, sequence_length))
+                
+            elif class_name == 'asthma':
+                # Asthma: wheezing patterns in mel spectrogram
+                features[30:50, :] += 0.4 * np.sin(np.linspace(0, 8*np.pi, sequence_length))
+                # Higher variance in mid-frequency range
+                features[20:40, :] += np.random.normal(0, 0.3, (20, sequence_length))
+                
+            elif class_name == 'bronchitis':
+                # Bronchitis: emphasis on lower frequencies
+                features[:15, :] += np.random.normal(0.4, 0.2, (15, sequence_length))
+                # More irregular patterns
+                features += np.random.exponential(0.1, features.shape) - 0.1
+            
+            X.append(features)
+            y.append(class_name)
+    
+    X = np.array(X)
+    y = np.array(y)
+    
+    print(f"✅ Sample dataset created:")
+    print(f"   Shape: {X.shape}")
+    print(f"   Classes: {np.unique(y)}")
+    
+    return X, y
+
+# Create sample dataset
+X_sample, y_sample = create_realistic_sample_dataset()
+
+# Visualize sample features
+def visualize_class_features(X, y, class_names):
+    """Visualize average features for each class"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('Average Feature Patterns by Class', fontsize=16)
+    
+    for idx, class_name in enumerate(class_names):
+        class_mask = y == class_name
+        class_features = X[class_mask]
+        avg_features = np.mean(class_features, axis=0)
+        
+        row, col = idx // 2, idx % 2
+        im = axes[row, col].imshow(avg_features, aspect='auto', cmap='viridis')
+        axes[row, col].set_title(f'{class_name.title()} (n={np.sum(class_mask)})')
+        axes[row, col].set_xlabel('Time Frames')
+        axes[row, col].set_ylabel('Feature Index')
+        plt.colorbar(im, ax=axes[row, col])
+    
+    plt.tight_layout()
+    plt.show()
+
+# Visualize the sample dataset
+visualize_class_features(X_sample, y_sample, ['healthy', 'covid', 'asthma', 'bronchitis'])
+
+# =============================================================================
+# Cell 7: Training Pipeline Setup
+# =============================================================================
+
+def setup_training_pipeline(X, y, test_size=0.2, val_size=0.2):
+    """Setup complete training pipeline"""
+    print("⚙️  Setting up training pipeline...")
+    
+    # Encode labels
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(y)
+    y_categorical = to_categorical(y_encoded)
+    
+    class_names = label_encoder.classes_
+    num_classes = len(class_names)
+    
+    print(f"🏷️  Label encoding complete:")
+    for i, class_name in enumerate(class_names):
+        print(f"   {i}: {class_name}")
+    
+    # Split dataset
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y_categorical, test_size=(test_size + val_size), 
+        random_state=42, stratify=y_categorical
+    )
+    
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=(test_size / (test_size + val_size)), 
+        random_state=42, stratify=y_temp
+    )
+    
+    print(f"📊 Dataset split complete:")
+    print(f"   Training set: {X_train.shape[0]} samples ({X_train.shape[0]/len(X)*100:.1f}%)")
+    print(f"   Validation set: {X_val.shape[0]} samples ({X_val.shape[0]/len(X)*100:.1f}%)")
+    print(f"   Test set: {X_test.shape[0]} samples ({X_test.shape[0]/len(X)*100:.1f}%)")
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, label_encoder, class_names
+
+# Setup training pipeline with sample data
+X_train, X_val, X_test, y_train, y_val, y_test, label_encoder, class_names = setup_training_pipeline(X_sample, y_sample)
+
+print("✅ Training pipeline setup complete!")
+
+# =============================================================================
+# Cell 8: Training History Visualization
+# =============================================================================
+
+def plot_training_history(history, model_name):
+    """Plot comprehensive training history"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'{model_name} - Training History', fontsize=16)
+    
+    # Accuracy
+    axes[0, 0].plot(history.history['accuracy'], 'b-', label='Training', linewidth=2)
+    axes[0, 0].plot(history.history['val_accuracy'], 'r-', label='Validation', linewidth=2)
+    axes[0, 0].set_title('Model Accuracy')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Accuracy')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Loss
+    axes[0, 1].plot(history.history['loss'], 'b-', label='Training', linewidth=2)
+    axes[0, 1].plot(history.history['val_loss'], 'r-', label='Validation', linewidth=2)
+    axes[0, 1].set_title('Model Loss')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Precision
+    if 'precision' in history.history:
+        axes[1, 0].plot(history.history['precision'], 'b-', label='Training', linewidth=2)
+        axes[1, 0].plot(history.history['val_precision'], 'r-', label='Validation', linewidth=2)
+        axes[1, 0].set_title('Model Precision')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Precision')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # Recall
+    if 'recall' in history.history:
+        axes[1, 1].plot(history.history['recall'], 'b-', label='Training', linewidth=2)
+        axes[1, 1].plot(history.history['val_recall'], 'r-', label='Validation', linewidth=2)
+        axes[1, 1].set_title('Model Recall')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Recall')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print best metrics
+    best_val_acc = max(history.history['val_accuracy'])
+    best_epoch = history.history['val_accuracy'].index(best_val_acc) + 1
+    
+    print(f"🎯 Best Validation Accuracy: {best_val_acc:.4f} (Epoch {best_epoch})")
+    print(f"📊 Final Training Accuracy: {history.history['accuracy'][-1]:.4f}")
+    print(f"📊 Final Validation Accuracy: {history.history['val_accuracy'][-1]:.4f}")
+
+print("✅ Training visualization functions defined!")
+
+# =============================================================================
+# Cell 9: Train CNN Model
+# =============================================================================
+
+print("🚀 TRAINING CNN MODEL")
+print("=" * 50)
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Initialize CNN model
+input_shape = X_train.shape[1:]
+num_classes = len(class_names)
+
+cnn_model = CoughClassificationModel(input_shape, num_classes)
+model_cnn = cnn_model.build_cnn_model(dropout_rate=0.5)
+cnn_model.compile_model(learning_rate=0.001)
+
+print("\n📋 CNN Model Summary:")
+model_cnn.summary()
+
+# Count parameters
+total_params = model_cnn.count_params()
+print(f"\n📊 Total Parameters: {total_params:,}")
+
+# Train CNN model
+print("\n🚀 Starting CNN training...")
+history_cnn = cnn_model.train(
+    X_train, y_train, X_val, y_val, 
+    epochs=50, batch_size=32, model_name="cnn"
+)
+
+# Plot training history
+plot_training_history(history_cnn, "CNN Model")
+
+print("✅ CNN model training completed!")
+
+# =============================================================================
+# Cell 10: Train CNN+RNN Model
+# =============================================================================
+
+print("\n🚀 TRAINING CNN+RNN MODEL")
+print("=" * 50)
+
+# Initialize CNN+RNN model
+cnn_rnn_model = CoughClassificationModel(input_shape, num_classes)
+model_hybrid = cnn_rnn_model.build_cnn_rnn_model(dropout_rate=0.5)
+cnn_rnn_model.compile_model(learning_rate=0.001)
+
+print("\n📋 CNN+RNN Model Summary:")
+model_hybrid.summary()
+
+# Count parameters
+total_params_hybrid = model_hybrid.count_params()
+print(f"\n📊 Total Parameters: {total_params_hybrid:,}")
+
+# Train CNN+RNN model
+print("\n🚀 Starting CNN+RNN training...")
+history_hybrid = cnn_rnn_model.train(
+    X_train, y_train, X_val, y_val, 
+    epochs=50, batch_size=32, model_name="cnn_rnn"
+)
+
+# Plot training history
+plot_training_history(history_hybrid, "CNN+RNN Model")
+
+print("✅ CNN+RNN model training completed!")
+
+# =============================================================================
+# Cell 11: Model Evaluation and Comparison
+# =============================================================================
+
+print("\n🔍 MODEL EVALUATION")
+print("=" * 50)
+
+# Evaluate CNN model
+print("\n📊 CNN MODEL EVALUATION:")
+print("-" * 30)
+evaluator_cnn = CoughClassificationEvaluator(model_cnn, class_names)
+y_pred_cnn, y_pred_proba_cnn, f1_cnn = evaluator_cnn.evaluate_model(X_test, y_test)
+
+# Evaluate CNN+RNN model
+print("\n📊 CNN+RNN MODEL EVALUATION:")
+print("-" * 30)
+evaluator_hybrid = CoughClassificationEvaluator(model_hybrid, class_names)
+y_pred_hybrid, y_pred_proba_hybrid, f1_hybrid = evaluator_hybrid.evaluate_model(X_test, y_test)
+
+# Model comparison
+print("\n🏆 MODEL COMPARISON:")
+print("=" * 30)
+
+comparison_data = {
+    'Model': ['CNN', 'CNN+RNN'],
+    'Parameters': [f"{total_params:,}", f"{total_params_hybrid:,}"],
+    'F1-Score (Weighted)': [f"{f1_cnn:.3f}", f"{f1_hybrid:.3f}"],
+    'Best Val Accuracy': [
+        f"{max(history_cnn.history['val_accuracy']):.3f}",
+        f"{max(history_hybrid.history['val_accuracy']):.3f}"
+    ]
+}
+
+comparison_df = pd.DataFrame(comparison_data)
+print(comparison_df.to_string(index=False))
+
+# Determine best model
+best_model_name = "CNN+RNN" if f1_hybrid > f1_cnn else "CNN"
+best_model = model_hybrid if f1_hybrid > f1_cnn else model_cnn
+best_f1 = max(f1_cnn, f1_hybrid)
+
+print(f"\n🥇 Best performing model: {best_model_name} (F1: {best_f1:.3f})")
+
+# =============================================================================
+# Cell 12: Feature Analysis and Insights
+# =============================================================================
+
+def analyze_model_predictions(y_true, y_pred, y_pred_proba, class_names):
+    """Analyze model predictions and provide insights"""
+    print("\n🔬 PREDICTION ANALYSIS:")
+    print("-" * 30)
+    
+    # Convert to class indices
+    if y_true.ndim > 1:
+        y_true_idx = np.argmax(y_true, axis=1)
+    else:
+        y_true_idx = y_true
+    
+    # Confidence analysis
+    max_confidence = np.max(y_pred_proba, axis=1)
+    avg_confidence = np.mean(max_confidence)
+    
+    print(f"📊 Average prediction confidence: {avg_confidence:.3f}")
+    
+    # High confidence correct predictions
+    high_conf_correct = np.sum((y_pred == y_true_idx) & (max_confidence > 0.8))
+    high_conf_total = np.sum(max_confidence > 0.8)
+    
+    print(f"🎯 High confidence (>0.8) predictions: {high_conf_total}")
+    print(f"✅ High confidence correct predictions: {high_conf_correct}")
+    
+    if high_conf_total > 0:
+        high_conf_accuracy = high_conf_correct / high_conf_total
+        print(f"🎯 High confidence accuracy: {high_conf_accuracy:.3f}")
+    
+    # Low confidence predictions (potential misclassifications)
+    low_conf_mask = max_confidence < 0.6
+    if np.sum(low_conf_mask) > 0:
+        print(f"⚠️  Low confidence (<0.6) predictions: {np.sum(low_conf_mask)}")
+        print("   These samples might need manual review")
+    
+    # Class-wise confidence
+    plt.figure(figsize=(12, 6))
+    
+    plt.subplot(1, 2, 1)
+    plt.hist(max_confidence, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+    plt.axvline(avg_confidence, color='red', linestyle='--', label=f'Average: {avg_confidence:.3f}')
+    plt.xlabel('Prediction Confidence')
+    plt.ylabel('Number of Samples')
+    plt.title('Distribution of Prediction Confidence')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    class_confidence = []
+    for i, class_name in enumerate(class_names):
+        class_mask = y_true_idx == i
+        if np.sum(class_mask) > 0:
+            class_avg_conf = np.mean(max_confidence[class_mask])
+            class_confidence.append(class_avg_conf)
+        else:
+            class_confidence.append(0)
+    
+    bars = plt.bar(class_names, class_confidence, color=['lightcoral', 'lightblue', 'lightgreen', 'lightyellow'])
+    plt.xlabel('Class')
+    plt.ylabel('Average Confidence')
+    plt.title('Average Confidence by Class')
+    plt.xticks(rotation=45)
+    
+    # Add value labels on bars
+    for bar, conf in zip(bars, class_confidence):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                f'{conf:.3f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+
+# Analyze best model predictions
+y_true_test = np.argmax(y_test, axis=1)
+best_y_pred = y_pred_hybrid if f1_hybrid > f1_cnn else y_pred_cnn
+best_y_pred_proba = y_pred_proba_hybrid if f1_hybrid > f1_cnn else y_pred_proba_cnn
+
+analyze_model_predictions(y_true_test, best_y_pred, best_y_pred_proba, class_names)
+
+# =============================================================================
+# Cell 13: Inference Engine and Deployment
+# =============================================================================
+
+class CoughInferenceEngine:
+    """Inference engine for deployed model"""
+    
+    def __init__(self, model, class_names, preprocessor=None):
+        self.model = model
+        self.class_names = class_names
+        self.preprocessor = preprocessor or CoughPreprocessor()
+        print(f"🔧 Inference engine initialized for classes: {class_names}")
+    
+    def predict_from_features(self, features):
+        """Predict from pre-extracted features"""
+        if features.ndim == 2:
+            features = np.expand_dims(features, axis=0)
+        
+        prediction_proba = self.model.predict(features, verbose=0)
+        predicted_class_idx = np.argmax(prediction_proba)
+        predicted_class = self.class_names[predicted_class_idx]
+        confidence = prediction_proba[0][predicted_class_idx]
+        
+        return predicted_class, confidence, prediction_proba[0]
+    
+    def predict_from_audio_file(self, audio_file_path):
+        """Predict from audio file"""
+        # Load and preprocess audio
+        audio = self.preprocessor.load_audio(audio_file_path)
+        if audio is None:
+            return None, None, None
+        
+        audio = self.preprocessor.remove_silence(audio)
+        audio = self.preprocessor.noise_reduction(audio)
+        
+        # Extract features
+        mfcc = self.preprocessor.extract_mfcc(audio)
+        mel_spec = self.preprocessor.extract_mel_spectrogram(audio)
+        features = np.concatenate([mfcc, mel_spec], axis=0)
+        
+        return self.predict_from_features(features)
+    
+    def batch_predict(self, features_list):
+        """Batch prediction for multiple samples"""
+        results = []
+        
+        print(f"🔄 Processing {len(features_list)} samples...")
+        for i, features in enumerate(tqdm(features_list)):
+            pred_class, confidence, proba = self.predict_from_features(features)
+            results.append({
+                'sample_id': i,
+                'predicted_class': pred_class,
+                'confidence': confidence,
+                'probabilities': proba
+            })
+        
+        return results
+
+# Initialize inference engine with best model
+print("🚀 SETTING UP INFERENCE ENGINE")
+print("=" * 50)
+
+inference_engine = CoughInferenceEngine(best_model, class_names)
+
+# Test inference with sample data
+print("\n🧪 Testing inference with sample data...")
+sample_features = X_test[:5]  # Take 5 test samples
+sample_results = inference_engine.batch_predict(sample_features)
+
+# Display results
+print(f"\n📋 Sample Inference Results:")
+for i, result in enumerate(sample_results):
+    true_class = class_names[np.argmax(y_test[i])]
+    pred_class = result['predicted_class']
+    confidence = result['confidence']
+    
+    status = "✅ Correct" if pred_class == true_class else "❌ Incorrect"
+    print(f"Sample {i+1}: {pred_class} (conf: {confidence:.3f}) | True: {true_class} | {status}")
+
+# =============================================================================
+# Cell 14: Save Models and Create Deployment Files
+# =============================================================================
+
+print("\n💾 SAVING MODELS AND CREATING DEPLOYMENT FILES")
+print("=" * 50)
+
+# Save models
+model_cnn.save('cough_cnn_model.h5')
+model_hybrid.save('cough_cnn_rnn_model.h5')
+
+# Save the best model separately
+best_model.save('best_cough_model.h5')
+
+# Save label encoder
+import pickle
+with open('label_encoder.pkl', 'wb') as f:
+    pickle.dump(label_encoder, f)
+
+print("✅ Models saved successfully!")
+print("   - cough_cnn_model.h5")
+print("   - cough_cnn_rnn_model.h5") 
+print("   - best_cough_model.h5")
+print("   - label_encoder.pkl")
+
+# Create simple inference script for deployment
+inference_script = '''
+import numpy as np
+import librosa
+import tensorflow as tf
+from tensorflow import keras
+import pickle
+
+def predict_cough(audio_file_path, model_path='best_cough_model.h5', 
+                 encoder_path='label_encoder.pkl'):
+    """
+    Simple inference function for cough classification
+    
+    Args:
+        audio_file_path: Path to audio file
+        model_path: Path to trained model
+        encoder_path: Path to label encoder
+    
+    Returns:
+        predicted_class, confidence, all_probabilities
+    """
+    
+    # Load model and encoder
+    model = keras.models.load_model(model_path)
+    with open(encoder_path, 'rb') as f:
+        label_encoder = pickle.load(f)
+    
+    # Audio preprocessing parameters
+    sr = 22050
+    n_mfcc = 13
+    n_mels = 64
+    target_length = 128
+    
+    # Load and preprocess audio
+    audio, _ = librosa.load(audio_file_path, sr=sr, duration=3.0)
+    
+    # Remove silence and reduce noise
+    audio, _ = librosa.effects.trim(audio, top_db=30)
+    
+    # Extract MFCC features
+    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc)
+    if mfcc.shape[1] < target_length:
+        mfcc = np.pad(mfcc, ((0, 0), (0, target_length - mfcc.shape[1])), mode='constant')
+    else:
+        mfcc = mfcc[:, :target_length]
+    
+    # Extract mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=n_mels)
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+    if mel_spec_db.shape[1] < target_length:
+        mel_spec_db = np.pad(mel_spec_db, ((0, 0), (0, target_length - mel_spec_db.shape[1])), mode='constant')
+    else:
+        mel_spec_db = mel_spec_db[:, :target_length]
+    
+    # Combine features
+    features = np.concatenate([mfcc, mel_spec_db], axis=0)
+    features = np.expand_dims(features, axis=0)
+    
+    # Predict
+    prediction_proba = model.predict(features, verbose=0)
+    predicted_class_idx = np.argmax(prediction_proba)
+    predicted_class = label_encoder.classes_[predicted_class_idx]
+    confidence = prediction_proba[0][predicted_class_idx]
+    
+    return predicted_class, confidence, prediction_proba[0]
+
+def predict_cough_batch(audio_files, model_path='best_cough_model.h5', 
+                       encoder_path='label_encoder.pkl'):
+    """Batch prediction for multiple audio files"""
+    results = []
+    
+    for audio_file in audio_files:
+        try:
+            pred_class, confidence, probs = predict_cough(audio_file, model_path, encoder_path)
+            results.append({
+                'file': audio_file,
+                'predicted_class': pred_class,
+                'confidence': confidence,
+                'probabilities': dict(zip(['healthy', 'covid', 'asthma', 'bronchitis'], probs))
+            })
+        except Exception as e:
+            results.append({
+                'file': audio_file,
+                'error': str(e)
+            })
+    
+    return results
+
+# Example usage:
+if __name__ == "__main__":
+    # Single prediction
+    # predicted_class, confidence, probs = predict_cough('path/to/cough.wav')
+    # print(f"Prediction: {predicted_class} (Confidence: {confidence:.3f})")
+    
+    # Batch prediction
+    # audio_files = ['cough1.wav', 'cough2.wav', 'cough3.wav']
+    # results = predict_cough_batch(audio_files)
+    # for result in results:
+    #     print(result)
+    
+    print("Cough classification inference script ready!")
+'''
+
+with open('simple_inference.py', 'w') as f:
+    f.write(inference_script)
+
+print("✅ Deployment script created: simple_inference.py")
+
+# Create requirements file
+requirements = '''tensorflow>=2.10.0
+librosa>=0.9.0
+scikit-learn>=1.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+tqdm>=4.60.0
+'''
+
+with open('requirements.txt', 'w') as f:
+    f.write(requirements)
+
+print("✅ Requirements file created: requirements.txt")
+
+# =============================================================================
+# Cell 15: Final Summary and Next Steps
+# =============================================================================
+
+def generate_final_report():
+    """Generate final comprehensive report"""
+    print("\n" + "="*60)
+    print("🎯 COUGH SOUND CLASSIFICATION SYSTEM - FINAL REPORT")
+    print("="*60)
+    
+    print(f"\n📊 DATASET SUMMARY:")
+    print(f"   • Total samples: {len(X_sample)}")
+    print(f"   • Classes: {', '.join(class_names)}")
+    print(f"   • Feature dimensions: {X_sample.shape[1:]} (MFCC + Mel-spectrogram)")
+    print(f"   • Training samples: {X_train.shape[0]}")
+    print(f"   • Validation samples: {X_val.shape[0]}")
+    print(f"   • Test samples: {X_test.shape[0]}")
+    
+    print(f"\n🧠 MODEL ARCHITECTURES:")
+    print(f"   • CNN Model: {total_params:,} parameters")
+    print(f"   • CNN+RNN Model: {total_params_hybrid:,} parameters")
+    print(f"   • Best Model: {best_model_name}")
+    
+    print(f"\n📈 PERFORMANCE METRICS:")
+    print(f"   • CNN F1-Score: {f1_cnn:.3f}")
+    print(f"   • CNN+RNN F1-Score: {f1_hybrid:.3f}")
+    print(f"   • Best Validation Accuracy: {max(max(history_cnn.history['val_accuracy']), max(history_hybrid.history['val_accuracy'])):.3f}")
+    
+    print(f"\n💾 SAVED FILES:")
+    print(f"   • cough_cnn_model.h5")
+    print(f"   • cough_cnn_rnn_model.h5")
+    print(f"   • best_cough_model.h5")
+    print(f"   • label_encoder.pkl")
+    print(f"   • simple_inference.py")
+    print(f"   • requirements.txt")
+    
+    print(f"\n🚀 DEPLOYMENT READY:")
+    print(f"   • Inference engine configured")
+    print(f"   • Batch processing supported")
+    print(f"   • Real-time prediction capable")
+    
+    print(f"\n📝 NEXT STEPS:")
+    print(f"   1. Replace sample data with real datasets:")
+    print(f"      - Download COUGHVID from Kaggle/Zenodo")
+    print(f"      - Download Coswara from Zenodo") 
+    print(f"      - Clone Sound-Dr from GitHub")
+    print(f"   2. Use the CoughDatasetLoader class in Cell 3")
+    print(f"   3. Retrain models with real data")
+    print(f"   4. Fine-tune hyperparameters")
+    print(f"   5. Deploy using simple_inference.py")
+    
+    print(f"\n🎯 USAGE EXAMPLE:")
+    print(f"   ```python")
+    print(f"   from simple_inference import predict_cough")
+    print(f"   ")
+    print(f"   result = predict_cough('new_cough_sample.wav')")
+    print(f"   print(f'Prediction: {{result[0]}} ({{result[1]:.3f}})')")
+    print(f"   ```")
+    
+    print("\n" + "="*60)
+    print("✅ SYSTEM SETUP COMPLETE!")
+    print("="*60)
+
+generate_final_report()
+
+# Create a summary dataframe
+summary_data = {
+    'Metric': [
+        'Total Samples',
+        'Classes',
+        'CNN Parameters',
+        'CNN+RNN Parameters',
+        'CNN F1-Score',
+        'CNN+RNN F1-Score',
+        'Best Model',
+        'Training Time (approx)'
+    ],
+    'Value': [
+        f"{len(X_sample)}",
+        f"{len(class_names)}",
+        f"{total_params:,}",
+        f"{total_params_hybrid:,}",
+        f"{f1_cnn:.3f}",
+        f"{f1_hybrid:.3f}",
+        best_model_name,
+        "50 epochs per model"
+    ]
+}
+
+summary_df = pd.DataFrame(summary_data)
+print("\n📋 SUMMARY TABLE:")
+print(summary_df.to_string(index=False))
+
+print(f"\n🎉 Congratulations! Your cough classification system is ready to use!")
+print(f"Run each cell in sequence to train your models and start classifying cough sounds!")
