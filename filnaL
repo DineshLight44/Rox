@@ -1,0 +1,583 @@
+# Audio Classification with CNN + BiLSTM
+# Deep Learning Pipeline for Medical Audio Classification
+
+# ## 1. Import Required Libraries
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, BatchNormalization, 
+                                   Dropout, LSTM, Bidirectional, Dense, 
+                                   GlobalMaxPooling2D, Input, Reshape, 
+                                   TimeDistributed, Flatten, Permute)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.utils import to_categorical
+import os
+import warnings
+from itertools import cycle
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Configure matplotlib
+plt.style.use('default')
+plt.rcParams['figure.figsize'] = (12, 8)
+
+print("Libraries imported successfully!")
+print(f"TensorFlow version: {tf.__version__}")
+
+# ## 2. Load and Explore the Dataset
+
+# Load the cleaned metadata
+print("Loading dataset...")
+df = pd.read_csv('metadata_cleaned.csv')
+
+print(f"Dataset shape: {df.shape}")
+print(f"Columns: {list(df.columns)}")
+print("\nFirst few rows:")
+print(df.head())
+
+print("\nDataset info:")
+print(df.info())
+
+print("\nLabel distribution:")
+label_counts = df['label'].value_counts()
+print(label_counts)
+
+# Visualize label distribution
+plt.figure(figsize=(10, 6))
+label_counts.plot(kind='bar')
+plt.title('Distribution of Disease Classes')
+plt.xlabel('Disease Class')
+plt.ylabel('Number of Samples')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ## 3. Load Features from .npy Files
+
+print("Loading mel-spectrogram features...")
+features_list = []
+labels_list = []
+failed_loads = 0
+
+for idx, row in df.iterrows():
+    try:
+        feature_path = row['feature_npy']
+        if os.path.exists(feature_path):
+            mel_spec = np.load(feature_path)
+            features_list.append(mel_spec)
+            labels_list.append(row['label'])
+        else:
+            print(f"Warning: Feature file not found: {feature_path}")
+            failed_loads += 1
+    except Exception as e:
+        print(f"Error loading {feature_path}: {e}")
+        failed_loads += 1
+    
+    # Progress indicator
+    if (idx + 1) % 100 == 0:
+        print(f"Processed {idx + 1}/{len(df)} files")
+
+print(f"\nSuccessfully loaded {len(features_list)} feature files")
+if failed_loads > 0:
+    print(f"Failed to load {failed_loads} files")
+
+# Convert to numpy arrays
+X = np.array(features_list)
+y = np.array(labels_list)
+
+print(f"\nFeatures shape: {X.shape}")
+print(f"Labels shape: {y.shape}")
+print(f"Feature data type: {X.dtype}")
+print(f"Feature range: [{X.min():.3f}, {X.max():.3f}]")
+
+# Visualize sample mel-spectrogram
+plt.figure(figsize=(12, 6))
+sample_idx = 0
+plt.subplot(1, 2, 1)
+plt.imshow(X[sample_idx], aspect='auto', origin='lower', cmap='viridis')
+plt.title(f'Sample Mel-Spectrogram\nLabel: {y[sample_idx]}')
+plt.xlabel('Time Frames')
+plt.ylabel('Mel Frequency Bins')
+plt.colorbar()
+
+plt.subplot(1, 2, 2)
+plt.hist(X[sample_idx].flatten(), bins=50, alpha=0.7)
+plt.title('Histogram of Mel-Spectrogram Values')
+plt.xlabel('Amplitude')
+plt.ylabel('Frequency')
+plt.tight_layout()
+plt.show()
+
+# ## 4. Data Preprocessing
+
+# Split the dataset
+print("Splitting dataset...")
+X_temp, X_test, y_temp, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_temp, y_temp, test_size=0.25, random_state=42, stratify=y_temp
+)
+
+print(f"Training set: {X_train.shape}, {y_train.shape}")
+print(f"Validation set: {X_val.shape}, {y_val.shape}")
+print(f"Test set: {X_test.shape}, {y_test.shape}")
+
+# Normalize features (z-score normalization)
+print("\nNormalizing features...")
+# Reshape for normalization
+X_train_flat = X_train.reshape(X_train.shape[0], -1)
+X_val_flat = X_val.reshape(X_val.shape[0], -1)
+X_test_flat = X_test.reshape(X_test.shape[0], -1)
+
+scaler = StandardScaler()
+X_train_norm = scaler.fit_transform(X_train_flat)
+X_val_norm = scaler.transform(X_val_flat)
+X_test_norm = scaler.transform(X_test_flat)
+
+# Reshape back to original shape
+X_train_norm = X_train_norm.reshape(X_train.shape)
+X_val_norm = X_val_norm.reshape(X_val.shape)
+X_test_norm = X_test_norm.reshape(X_test.shape)
+
+print(f"Normalized feature range: [{X_train_norm.min():.3f}, {X_train_norm.max():.3f}]")
+
+# Encode labels
+label_encoder = LabelEncoder()
+y_train_encoded = label_encoder.fit_transform(y_train)
+y_val_encoded = label_encoder.transform(y_val)
+y_test_encoded = label_encoder.transform(y_test)
+
+n_classes = len(label_encoder.classes_)
+class_names = label_encoder.classes_
+
+print(f"Number of classes: {n_classes}")
+print(f"Class names: {class_names}")
+
+# One-hot encode labels
+y_train_onehot = to_categorical(y_train_encoded, n_classes)
+y_val_onehot = to_categorical(y_val_encoded, n_classes)
+y_test_onehot = to_categorical(y_test_encoded, n_classes)
+
+print(f"One-hot encoded labels shape: {y_train_onehot.shape}")
+
+# Prepare input shape for CNN
+input_shape = X_train_norm.shape[1:]
+print(f"Input shape for model: {input_shape}")
+
+# Add channel dimension if needed (for CNN)
+if len(input_shape) == 2:
+    X_train_norm = np.expand_dims(X_train_norm, -1)
+    X_val_norm = np.expand_dims(X_val_norm, -1)
+    X_test_norm = np.expand_dims(X_test_norm, -1)
+    input_shape = X_train_norm.shape[1:]
+    print(f"Updated input shape with channel dimension: {input_shape}")
+
+# ## 5. Build CNN + BiLSTM Model
+
+def create_cnn_bilstm_model(input_shape, n_classes):
+    """
+    Create a hybrid CNN + BiLSTM model for audio classification
+    """
+    input_layer = Input(shape=input_shape)
+    
+    # CNN Feature Extraction
+    x = Conv2D(32, (3, 3), activation='relu', padding='same')(input_layer)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Dropout(0.25)(x)
+    
+    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Dropout(0.25)(x)
+    
+    x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 2))(x)
+    x = Dropout(0.25)(x)
+    
+    # Prepare for LSTM (reshape to sequence)
+    # Global pooling across frequency dimension, keep time dimension
+    x = GlobalMaxPooling2D()(x)
+    x = Dropout(0.3)(x)
+    
+    # Reshape for LSTM (we need to create time steps)
+    # Since we used global pooling, we need to reshape differently
+    x = Dense(256, activation='relu')(x)
+    x = Dropout(0.3)(x)
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.3)(x)
+    
+    # Final classification layers
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output = Dense(n_classes, activation='softmax', name='output')(x)
+    
+    model = Model(inputs=input_layer, outputs=output)
+    return model
+
+# Alternative model with proper LSTM integration
+def create_cnn_bilstm_model_v2(input_shape, n_classes):
+    """
+    Create CNN + BiLSTM model with proper sequence handling
+    """
+    input_layer = Input(shape=input_shape)
+    
+    # CNN Feature Extraction
+    x = Conv2D(32, (3, 3), activation='relu', padding='same')(input_layer)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 1))(x)  # Pool only frequency, keep time
+    x = Dropout(0.25)(x)
+    
+    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 1))(x)  # Pool only frequency, keep time
+    x = Dropout(0.25)(x)
+    
+    x = Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling2D((2, 1))(x)  # Pool only frequency, keep time
+    x = Dropout(0.25)(x)
+    
+    # Reshape for LSTM: (batch, time, features)
+    shape = x.shape
+    x = Reshape((shape[2], shape[1] * shape[3]))(x)  # (time_steps, freq_features)
+    
+    # BiLSTM layers
+    x = Bidirectional(LSTM(128, return_sequences=True, dropout=0.3))(x)
+    x = Bidirectional(LSTM(64, return_sequences=False, dropout=0.3))(x)
+    
+    # Final classification layers
+    x = Dense(128, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output = Dense(n_classes, activation='softmax')(x)
+    
+    model = Model(inputs=input_layer, outputs=output)
+    return model
+
+# Create the model
+print("Creating CNN + BiLSTM model...")
+try:
+    model = create_cnn_bilstm_model_v2(input_shape, n_classes)
+    print("Model created successfully!")
+except Exception as e:
+    print(f"Error with BiLSTM model, falling back to CNN-only: {e}")
+    model = create_cnn_bilstm_model(input_shape, n_classes)
+
+# Display model summary
+model.summary()
+
+# Visualize model architecture
+tf.keras.utils.plot_model(model, to_file='model_architecture.png', 
+                          show_shapes=True, show_layer_names=True)
+
+# ## 6. Compile and Train the Model
+
+# Compile the model
+optimizer = Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999)
+model.compile(
+    optimizer=optimizer,
+    loss='categorical_crossentropy',
+    metrics=['accuracy', 'precision', 'recall']
+)
+
+# Define callbacks
+callbacks = [
+    EarlyStopping(
+        monitor='val_loss',
+        patience=15,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    ModelCheckpoint(
+        'best_model.h5',
+        monitor='val_accuracy',
+        save_best_only=True,
+        save_weights_only=False,
+        verbose=1
+    ),
+    ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=8,
+        min_lr=1e-7,
+        verbose=1
+    )
+]
+
+# Train the model
+print("Starting model training...")
+history = model.fit(
+    X_train_norm, y_train_onehot,
+    validation_data=(X_val_norm, y_val_onehot),
+    epochs=100,
+    batch_size=32,
+    callbacks=callbacks,
+    verbose=1
+)
+
+print("Training completed!")
+
+# ## 7. Plot Training History
+
+# Plot training history
+fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+
+# Loss
+axes[0, 0].plot(history.history['loss'], label='Training Loss')
+axes[0, 0].plot(history.history['val_loss'], label='Validation Loss')
+axes[0, 0].set_title('Model Loss')
+axes[0, 0].set_xlabel('Epoch')
+axes[0, 0].set_ylabel('Loss')
+axes[0, 0].legend()
+axes[0, 0].grid(True)
+
+# Accuracy
+axes[0, 1].plot(history.history['accuracy'], label='Training Accuracy')
+axes[0, 1].plot(history.history['val_accuracy'], label='Validation Accuracy')
+axes[0, 1].set_title('Model Accuracy')
+axes[0, 1].set_xlabel('Epoch')
+axes[0, 1].set_ylabel('Accuracy')
+axes[0, 1].legend()
+axes[0, 1].grid(True)
+
+# Precision
+if 'precision' in history.history:
+    axes[1, 0].plot(history.history['precision'], label='Training Precision')
+    axes[1, 0].plot(history.history['val_precision'], label='Validation Precision')
+    axes[1, 0].set_title('Model Precision')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Precision')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+
+# Recall
+if 'recall' in history.history:
+    axes[1, 1].plot(history.history['recall'], label='Training Recall')
+    axes[1, 1].plot(history.history['val_recall'], label='Validation Recall')
+    axes[1, 1].set_title('Model Recall')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Recall')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+plt.tight_layout()
+plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ## 8. Model Evaluation
+
+# Load best model
+model = tf.keras.models.load_model('best_model.h5')
+
+# Evaluate on test set
+print("Evaluating model on test set...")
+test_loss, test_accuracy = model.evaluate(X_test_norm, y_test_onehot, verbose=0)[:2]
+print(f"Test Loss: {test_loss:.4f}")
+print(f"Test Accuracy: {test_accuracy:.4f}")
+
+# Make predictions
+y_pred_proba = model.predict(X_test_norm, verbose=0)
+y_pred = np.argmax(y_pred_proba, axis=1)
+
+# Classification Report
+print("\nClassification Report:")
+report = classification_report(y_test_encoded, y_pred, 
+                             target_names=class_names, 
+                             output_dict=True)
+print(classification_report(y_test_encoded, y_pred, target_names=class_names))
+
+# Convert report to DataFrame for better visualization
+report_df = pd.DataFrame(report).transpose()
+print("\nDetailed Metrics:")
+print(report_df.round(4))
+
+# ## 9. Confusion Matrix
+
+# Plot confusion matrix
+cm = confusion_matrix(y_test_encoded, y_pred)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Normalized confusion matrix
+cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Normalized Confusion Matrix')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.tight_layout()
+plt.savefig('confusion_matrix_normalized.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ## 10. ROC Curves
+
+# Compute ROC curves for multiclass
+if n_classes > 2:
+    # Binarize the labels for multiclass ROC
+    y_test_bin = label_binarize(y_test_encoded, classes=range(n_classes))
+    
+    plt.figure(figsize=(12, 10))
+    colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'red', 'green', 'purple'])
+    
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    
+    # Calculate ROC for each class
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_pred_proba[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    
+    # Calculate micro-average ROC
+    fpr["micro"], tpr["micro"], _ = roc_curve(y_test_bin.ravel(), y_pred_proba.ravel())
+    roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+    
+    # Plot ROC curves
+    for i, color in zip(range(n_classes), colors):
+        plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                label=f'ROC curve for {class_names[i]} (AUC = {roc_auc[i]:.2f})')
+    
+    plt.plot(fpr["micro"], tpr["micro"], color='deeppink', linestyle='--', lw=2,
+            label=f'Micro-average ROC (AUC = {roc_auc["micro"]:.2f})')
+    
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', alpha=0.5)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Multi-class ROC Curves')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('roc_curves.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+else:
+    # Binary classification ROC
+    fpr, tpr, _ = roc_curve(y_test_encoded, y_pred_proba[:, 1])
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, 
+             label=f'ROC curve (AUC = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Binary ROC Curve')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('roc_curve.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# ## 11. Feature Importance Analysis
+
+# Get model predictions for a few samples
+sample_indices = [0, 1, 2, 3, 4]
+sample_features = X_test_norm[sample_indices]
+sample_labels = [class_names[i] for i in y_test_encoded[sample_indices]]
+sample_predictions = model.predict(sample_features, verbose=0)
+sample_pred_classes = [class_names[i] for i in np.argmax(sample_predictions, axis=1)]
+
+# Visualize sample predictions
+fig, axes = plt.subplots(1, len(sample_indices), figsize=(20, 4))
+for i, idx in enumerate(sample_indices):
+    if sample_features.shape[-1] == 1:
+        # Remove channel dimension for visualization
+        mel_spec = sample_features[i, :, :, 0]
+    else:
+        mel_spec = sample_features[i]
+    
+    axes[i].imshow(mel_spec, aspect='auto', origin='lower', cmap='viridis')
+    axes[i].set_title(f'True: {sample_labels[i]}\nPred: {sample_pred_classes[i]}\nConf: {sample_predictions[i].max():.3f}')
+    axes[i].set_xlabel('Time')
+    axes[i].set_ylabel('Mel Frequency')
+
+plt.tight_layout()
+plt.savefig('sample_predictions.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ## 12. Save Results
+
+# Save model and results
+print("Saving results...")
+
+# Save final model
+model.save('final_model.h5')
+print("Model saved as 'final_model.h5'")
+
+# Save training history
+history_df = pd.DataFrame(history.history)
+history_df.to_csv('training_history.csv', index=False)
+print("Training history saved as 'training_history.csv'")
+
+# Save evaluation results
+results = {
+    'test_accuracy': test_accuracy,
+    'test_loss': test_loss,
+    'classification_report': report,
+    'class_names': class_names.tolist(),
+    'n_classes': n_classes
+}
+
+import json
+with open('evaluation_results.json', 'w') as f:
+    json.dump(results, f, indent=2, default=str)
+print("Evaluation results saved as 'evaluation_results.json'")
+
+# Save predictions
+predictions_df = pd.DataFrame({
+    'true_label': [class_names[i] for i in y_test_encoded],
+    'predicted_label': [class_names[i] for i in y_pred],
+    'true_label_encoded': y_test_encoded,
+    'predicted_label_encoded': y_pred
+})
+
+# Add prediction probabilities
+for i, class_name in enumerate(class_names):
+    predictions_df[f'prob_{class_name}'] = y_pred_proba[:, i]
+
+predictions_df.to_csv('test_predictions.csv', index=False)
+print("Test predictions saved as 'test_predictions.csv'")
+
+print("\nPipeline completed successfully!")
+print("Files saved:")
+print("- final_model.h5 (trained model)")
+print("- best_model.h5 (best checkpoint)")
+print("- training_history.csv (training metrics)")
+print("- evaluation_results.json (test results)")
+print("- test_predictions.csv (predictions)")
+print("- confusion_matrix.png")
+print("- confusion_matrix_normalized.png")
+print("- roc_curves.png")
+print("- training_history.png")
+print("- sample_predictions.png")
+print("- model_architecture.png")
